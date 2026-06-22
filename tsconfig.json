@@ -2,9 +2,11 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "CommonJS",
+    "outDir": "dist",
     "types": ["node"],
     "allowJs": true,
     "skipLibCheck": true,
     "noImplicitAny": false
-  }
+  },
+  "include": ["client.ts"]
 }

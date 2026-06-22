@@ -1,10 +1,10 @@
 {
-  "devDependencies": {
-    "@types/node": "^26.0.0"
+  "scripts": {
+    "start": "node client.ts",
+    "dev": "node client.ts"
   },
-  "dependencies": {
-    "http": "^0.0.1-security",
-    "path": "^0.12.7",
+  "devDependencies": {
+    "@types/node": "^26.0.0",
     "typescript": "^6.0.3"
   }
 }

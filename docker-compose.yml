@@ -1,0 +1,13 @@
+services:
+  stream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wholevideos-stream
+    ports:
+      - "5181:5181"
+    volumes:
+      - ./media:/app/media
+      - ./live:/app/live
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
