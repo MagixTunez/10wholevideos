@@ -1,21 +1,24 @@
-Hi make sure you have the .env configured to ur domain.
+configure the .env to ur liking
 
-Local run:
+basehost - forcing absolute urls so it doesn't have to auto detect host headers and it just lots more secure, I wouldn't change this as the domain is set ingame and would require a rebuild I thinkkk???? so just keep it the way it is (:
 
-node client.ts
+segmentDuration - target HLS segment length in seconds, lower values reduce latency but increase requests
 
-Docker run:
+segmentQueueConcurrency - max concurrent segment generation jobs for the non native path. This is rlly small but you can mess with it if you want
 
-1. Build and start
+useNativeHls - bool, using the ffmpeg HLS pipeline. This adds alot to the stability and would advise against changing it. It can mess with fetching segments in order and that will fuck up alot
 
-docker compose up --build
+nativeHlsListSize - number of segments kept in the live playlist window by ffmpeg. After the amount set it will kill the segments. Don't set this too high
 
-2. Stop
+hlsProgramDateTime - EXT-X-PROGRAM-DATE-TIME tags for segment TPS
 
-docker compose down
+enableNativePlaylistSyncRewrite - turns OFF server-side playlist rewriting.
+0 = serve FFmpeg playlist as-is (safer), 1 = rewrite for tighter multi-client sync
 
-Notes:
+syncLiveWindowSegments -
+Only used when enableNativePlaylistSyncRewrite=1.
+How many newest segments to keep in rewritten playlist.
 
-1. Container listens on port 5181.
-2. `./media` and `./live` are mounted into the container.
-3. `./.env` is mounted read-only into the container.
+hardSyncStartOffsetSeconds -
+Only used when enableNativePlaylistSyncRewrite=1.
+Adds an HLS start offset so clients begin near the same point in the vod (for the vine)

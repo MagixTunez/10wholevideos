@@ -1,7 +1,24 @@
+// @ts-nocheck
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
+
+let ffmpegStaticPath = '';
+let ffprobeStaticPath = '';
+
+try {
+  ffmpegStaticPath = require('ffmpeg-static') || '';
+} catch {
+  ffmpegStaticPath = '';
+}
+
+try {
+  const ffprobeStatic = require('ffprobe-static');
+  ffprobeStaticPath = ffprobeStatic && ffprobeStatic.path ? ffprobeStatic.path : '';
+} catch {
+  ffprobeStaticPath = '';
+}
 
 function loadEnvFile() {
   const envPath = path.join(process.cwd(), '.env');
@@ -50,6 +67,8 @@ function buildRuntimeEnv() {
 }
 
 const RuntimeEnv = buildRuntimeEnv();
+const FfmpegCommand = process.env.ffmpegPath || process.env.FFMPEG_PATH || ffmpegStaticPath || 'ffmpeg';
+const FfprobeCommand = process.env.ffprobePath || process.env.FFPROBE_PATH || ffprobeStaticPath || 'ffprobe';
 
 function commandAvailable(command) {
   const check = spawnSync(command, ['-version'], { stdio: 'ignore', env: RuntimeEnv });
@@ -59,40 +78,108 @@ function commandAvailable(command) {
 const ServePort = 5181;
 const VidsDir = path.join(process.cwd(), 'media');
 const OutputDir = path.join(process.cwd(), 'live');
-const SegmentDuration = 10;
+const SegmentDuration = Math.max(1, Number.parseInt(process.env.segmentDuration || process.env.SEGMENT_DURATION || '4', 10) || 4);
 const PlaylistSegments = 6;
-const NativeHlsListSize = 12;
-const PrebufferSegments = 6;
+const NativeHlsListSize = Math.max(3, Number.parseInt(process.env.nativeHlsListSize || process.env.NATIVE_HLS_LIST_SIZE || `${PlaylistSegments + 3}`, 10) || (PlaylistSegments + 3));
 const StartupWarmupSegments = 10;
-const RetainBackSegments = 20;
 const MinSegmentBytes = 4096;
-const ManifestStepMax = 2;
-const UseNativeHls = false;
+const UseNativeHls = (process.env.useNativeHls || process.env.USE_NATIVE_HLS || '1') !== '0';
+const EnableProgramDateTime = (process.env.hlsProgramDateTime || process.env.HLS_PROGRAM_DATE_TIME || '0') === '1';
+const EnableNativePlaylistSyncRewrite = (process.env.enableNativePlaylistSyncRewrite || '0') === '1';
 const UseMasterPlaylist = true;
 const PublicBaseUrl = process.env.basehost?.replace(/\/+$/, '');
-const HasFfmpeg = commandAvailable('ffmpeg');
-const HasFfprobe = commandAvailable('ffprobe');
-let playbackTime = 0;
+const HasFfmpeg = commandAvailable(FfmpegCommand);
+const HasFfprobe = commandAvailable(FfprobeCommand);
+const SegmentQueueConcurrency = Math.max(1, Number.parseInt(process.env.segmentQueueConcurrency || process.env.SEGMENT_QUEUE_CONCURRENCY || '2', 10) || 2);
+const SyncLiveWindowSegments = Math.max(2, Number.parseInt(process.env.syncLiveWindowSegments || '3', 10) || 3);
+const HardSyncStartOffsetSeconds = Math.max(
+  0.5,
+  Number.parseFloat(process.env.hardSyncStartOffsetSeconds || `${Math.max(1, SegmentDuration * 1.25)}`) || Math.max(1, SegmentDuration * 1.25)
+);
 let isRunning = false;
 const inFlightSegments = new Map();
-let prebufferTimer;
 let cachedTotalDuration = 0;
 let cachedVideoTimeline = Array();
-let manifestBaseSegment = 0;
-let highestRequestedSegment = -1;
 const segmentDurationCache = new Map();
 const segmentSourceCache = new Map();
+let pQueueInstancePromise = null;
+const fallbackSegmentQueue = {
+  active: 0,
+  pending: [],
+};
 let nativeHlsProcess = null;
 let activePlaylistName = '';
+let liveHeadSegmentIndex = -1;
+let streamPlaylistPollCount = 0;
+let lastStreamPlaylistPollLogAt = Date.now();
 
 function log(level, message, ...meta) {
   const stamp = new Date().toISOString();
+  const sink = typeof console[level] === 'function' ? console[level] : console.log;
   if (meta.length > 0) {
-    console[level](`[stream ${stamp}] ${message}`, meta[0]);
+    sink(`[stream ${stamp}] ${message}`, meta[0]);
     return;
   }
 
-  console[level](`[stream ${stamp}] ${message}`);
+  sink(`[stream ${stamp}] ${message}`);
+}
+
+async function getSegmentQueue() {
+  if (pQueueInstancePromise) {
+    return pQueueInstancePromise;
+  }
+
+  pQueueInstancePromise = import('p-queue')
+    .then((mod) => {
+      const PQueue = mod.default;
+      return new PQueue({ concurrency: SegmentQueueConcurrency });
+    })
+    .catch((err) => {
+      log('warn', 'p-queue unavailable, using fallback queue', {
+        error: err && typeof err === 'object' ? Reflect.get(err, 'message') : String(err),
+      });
+      return null;
+    });
+
+  return pQueueInstancePromise;
+}
+
+function runFallbackQueued(task) {
+  return new Promise((resolve, reject) => {
+    fallbackSegmentQueue.pending.push({ task, resolve, reject });
+
+    const pump = () => {
+      while (
+        fallbackSegmentQueue.active < SegmentQueueConcurrency
+        && fallbackSegmentQueue.pending.length > 0
+      ) {
+        const next = fallbackSegmentQueue.pending.shift();
+        if (!next) {
+          continue;
+        }
+
+        fallbackSegmentQueue.active += 1;
+        Promise.resolve()
+          .then(next.task)
+          .then(next.resolve, next.reject)
+          .finally(() => {
+            fallbackSegmentQueue.active -= 1;
+            pump();
+          });
+      }
+    };
+
+    pump();
+  });
+}
+
+async function enqueueSegmentTask(task) {
+  const queue = await getSegmentQueue();
+  if (queue) {
+    return queue.add(task);
+  }
+
+  return runFallbackQueued(task);
 }
 
 function mediaDirForPlaylist(playlistName) {
@@ -118,7 +205,11 @@ function liveDirForPlaylist(playlistName) {
 
 function listVideoFiles(playlistName = activePlaylistName) {
   const dir = mediaDirForPlaylist(playlistName);
-  return fs.readdirSync(dir).filter((file) => file.endsWith('.mp4'));
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    return [];
+  }
+
+  return fs.readdirSync(dir).filter((file) => file.toLowerCase().endsWith('.mp4'));
 }
 
 function activatePlaylist(playlistName) {
@@ -127,16 +218,13 @@ function activatePlaylist(playlistName) {
     return;
   }
 
-  stopPrebufferLoop();
   isRunning = false;
-  playbackTime = 0;
   cachedTotalDuration = 0;
   cachedVideoTimeline = Array();
-  manifestBaseSegment = 0;
-  highestRequestedSegment = -1;
   inFlightSegments.clear();
   segmentDurationCache.clear();
   segmentSourceCache.clear();
+  liveHeadSegmentIndex = -1;
   activePlaylistName = next;
   startPlayback(true);
 }
@@ -194,24 +282,26 @@ function isSegmentHealthy(segmentIndex, playlistName = activePlaylistName) {
   return fs.existsSync(file) && fs.statSync(file).size >= MinSegmentBytes;
 }
 
-function clearLiveSegments() {
-  if (!fs.existsSync(OutputDir)) {
+function clearLiveSegments(playlistName = activePlaylistName) {
+  const liveDir = liveDirForPlaylist(playlistName);
+  if (!fs.existsSync(liveDir)) {
     return;
   }
 
-  for (const file of fs.readdirSync(OutputDir)) {
+  for (const file of fs.readdirSync(liveDir)) {
     if (!/^segment-\d+\.ts$/.test(file)) {
       if (file === 'stream.m3u8' || file === 'concat.txt') {
-        fs.rmSync(path.join(OutputDir, file), { force: true });
+        fs.rmSync(path.join(liveDir, file), { force: true });
       }
       continue;
     }
 
-    fs.rmSync(path.join(OutputDir, file), { force: true });
+    fs.rmSync(path.join(liveDir, file), { force: true });
   }
 
   segmentDurationCache.clear();
   segmentSourceCache.clear();
+  liveHeadSegmentIndex = -1;
 }
 
 function startNativeHlsPipeline() {
@@ -229,8 +319,11 @@ function startNativeHlsPipeline() {
   const concatPath = writeConcatFile();
   const playlistPath = path.join(OutputDir, 'stream.m3u8');
   const segmentPattern = path.join(OutputDir, 'segment-%d.ts');
+  const nativeHlsFlags = EnableProgramDateTime
+    ? 'delete_segments+append_list+independent_segments+program_date_time'
+    : 'delete_segments+append_list+independent_segments';
 
-  const proc = spawn('ffmpeg', [
+  const proc = spawn(FfmpegCommand, [
     '-y',
     '-re',
     '-stream_loop',
@@ -276,7 +369,9 @@ function startNativeHlsPipeline() {
     '-hls_list_size',
     `${NativeHlsListSize}`,
     '-hls_flags',
-    'append_list+independent_segments+program_date_time',
+    nativeHlsFlags,
+    '-hls_delete_threshold',
+    '2',
     '-hls_segment_filename',
     segmentPattern,
     playlistPath,
@@ -297,33 +392,11 @@ function startNativeHlsPipeline() {
     nativeHlsProcess = null;
   });
 
-  log('info', 'Native HLS pipeline started', { videos: videos.length, playlistPath });
-}
-
-function getSegmentDurationSeconds(segmentIndex) {
-  const cached = segmentDurationCache.get(segmentIndex);
-  if (typeof cached === 'number' && Number.isFinite(cached) && cached > 0) {
-    return cached;
-  }
-
-  const file = segmentFilePath(segmentIndex);
-  if (!fs.existsSync(file)) {
-    return 0;
-  }
-
-  const probe = spawnSync(
-    'ffprobe',
-    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', file],
-    { encoding: 'utf8', env: RuntimeEnv }
-  );
-  const duration = Number.parseFloat((probe.stdout || '').trim());
-  if (!Number.isFinite(duration) || duration <= 0) {
-    // MPEG-TS probing can intermittently fail; keep manifest stable with configured duration.
-    return SegmentDuration;
-  }
-
-  segmentDurationCache.set(segmentIndex, duration);
-  return duration;
+  log('info', 'Native HLS pipeline started', {
+    videos: videos.length,
+    playlistPath,
+    nativeHlsFlags,
+  });
 }
 
 function tryRemoveFile(filePath) {
@@ -367,7 +440,7 @@ function getVideoTimeline() {
   let cursor = 0;
   for (const file of files) {
     const probe = spawnSync(
-      'ffprobe',
+      FfprobeCommand,
       ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', file.filePath],
       { encoding: 'utf8', env: RuntimeEnv }
     );
@@ -453,7 +526,7 @@ function getTotalDurationSeconds() {
 
 function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
   return new Promise((resolve) => {
-    const ffmpeg = spawn('ffmpeg', [
+    const ffmpeg = spawn(FfmpegCommand, [
       '-y',
       '-fflags',
       '+genpts',
@@ -493,6 +566,14 @@ function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
       '2',
       '-b:a',
       '128k',
+      '-muxpreload',
+      '0',
+      '-muxdelay',
+      '0',
+      '-mpegts_flags',
+      '+initial_discontinuity',
+      '-reset_timestamps',
+      '1',
       '-f',
       'mpegts',
       segmentFile,
@@ -514,8 +595,28 @@ function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
   });
 }
 
+function probeDurationSeconds(filePath) {
+  if (!HasFfprobe || !fs.existsSync(filePath)) {
+    return 0;
+  }
+
+  const probe = spawnSync(
+    FfprobeCommand,
+    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', filePath],
+    { encoding: 'utf8', env: RuntimeEnv }
+  );
+
+  const duration = Number.parseFloat((probe.stdout || '').trim());
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
 function generateSegment(segmentIndex) {
   const segmentFile = segmentFilePath(segmentIndex);
+  const liveDir = liveDirForPlaylist(activePlaylistName);
+  if (!fs.existsSync(liveDir)) {
+    fs.mkdirSync(liveDir, { recursive: true });
+  }
+
   if (isSegmentReady(segmentIndex)) {
     return Promise.resolve(segmentFile);
   }
@@ -545,13 +646,6 @@ function generateSegment(segmentIndex) {
   let selectedPath = target.filePath;
   let selectedName = target.fileName;
   let safeOffset = Math.min(target.localOffset, maxOffset);
-  const remaining = target.sourceDuration - safeOffset;
-  if (remaining < SegmentDuration && target.timelineIndex + 1 < timeline.length) {
-    const next = timeline[target.timelineIndex + 1];
-    selectedPath = next.filePath;
-    selectedName = next.fileName;
-    safeOffset = 0;
-  }
 
   return new Promise(async (resolve, reject) => {
     log('info', 'Generating segment', {
@@ -569,6 +663,11 @@ function generateSegment(segmentIndex) {
 
     if (primaryOk) {
       segmentSourceCache.set(segmentIndex, selectedName);
+      const generatedDuration = probeDurationSeconds(segmentFile);
+      if (generatedDuration > 0) {
+        segmentDurationCache.set(segmentIndex, generatedDuration);
+      }
+      liveHeadSegmentIndex = Math.max(liveHeadSegmentIndex, segmentIndex);
       log('info', 'Segment generated', { segmentIndex, segmentFile });
       resolve(segmentFile);
       return;
@@ -592,6 +691,11 @@ function generateSegment(segmentIndex) {
       const fallback = await runFfmpegToSegment(next.filePath, 0, segmentFile);
       if (getField(fallback, 'ok', false) === true) {
         segmentSourceCache.set(segmentIndex, next.fileName);
+        const generatedDuration = probeDurationSeconds(segmentFile);
+        if (generatedDuration > 0) {
+          segmentDurationCache.set(segmentIndex, generatedDuration);
+        }
+        liveHeadSegmentIndex = Math.max(liveHeadSegmentIndex, segmentIndex);
         log('info', 'Segment generated from fallback source file', { segmentIndex, segmentFile });
         resolve(segmentFile);
         return;
@@ -622,33 +726,12 @@ function ensureSegment(segmentIndex) {
     return Promise.resolve(segmentFile);
   }
 
-  const job = generateSegment(segmentIndex).finally(() => {
+  const job = enqueueSegmentTask(() => generateSegment(segmentIndex)).finally(() => {
     inFlightSegments.delete(segmentIndex);
   });
 
   inFlightSegments.set(segmentIndex, job);
   return job;
-}
-
-function cleanupOldSegments(currentIndex) {
-  const minKeep = Math.max(0, currentIndex - RetainBackSegments);
-  for (const file of fs.readdirSync(OutputDir)) {
-    const match = file.match(/^segment-(\d+)\.ts$/);
-    if (!match) {
-      continue;
-    }
-
-    const idx = Number.parseInt(match[1], 10);
-    if (idx < minKeep) {
-      fs.rmSync(path.join(OutputDir, file), { force: true });
-      segmentDurationCache.delete(idx);
-      segmentSourceCache.delete(idx);
-    }
-  }
-}
-
-async function prebufferAroundCurrent() {
-  // Request-driven mode: prebuffer is intentionally disabled to avoid drift.
 }
 
 async function preGenerateFromIndex(startIndex, count) {
@@ -671,17 +754,76 @@ async function ensureContiguousWindow(startIndex, count) {
   }
 }
 
-function startPrebufferLoop() {
-  // Request-driven mode: no background prebuffer loop.
+function prefetchContiguousWindow(startIndex, count) {
+  void ensureContiguousWindow(startIndex, count).catch((err) => {
+    log('warn', 'Background segment prefetch failed', {
+      startIndex,
+      count,
+      error: err && typeof err === 'object' ? Reflect.get(err, 'message') : String(err),
+    });
+  });
 }
 
-function stopPrebufferLoop() {
-  if (!prebufferTimer) {
-    return;
+function contiguousReadyCount(segmentIndex) {
+  let contiguousCount = 0;
+  for (let i = 0; i < PlaylistSegments; i++) {
+    if (!isSegmentReady(segmentIndex + i, activePlaylistName)) {
+      break;
+    }
+
+    contiguousCount++;
   }
 
-  clearInterval(prebufferTimer);
-  prebufferTimer = undefined;
+  return contiguousCount;
+}
+
+function findLatestReadyWindowStart(playlistName = activePlaylistName) {
+  const liveDir = liveDirForPlaylist(playlistName);
+  if (!fs.existsSync(liveDir) || !fs.statSync(liveDir).isDirectory()) {
+    return -1;
+  }
+
+  const indexes = fs.readdirSync(liveDir)
+    .map((name) => {
+      const match = name.match(/^segment-(\d+)\.ts$/);
+      return match ? Number.parseInt(match[1], 10) : -1;
+    })
+    .filter((idx) => Number.isInteger(idx) && idx >= 0)
+    .sort((a, b) => a - b);
+
+  if (indexes.length === 0) {
+    return -1;
+  }
+
+  let runStart = indexes[0];
+  let runEnd = indexes[0];
+  let bestStart = -1;
+
+  const flushRun = () => {
+    const runLength = runEnd - runStart + 1;
+    if (runLength <= 0) {
+      return;
+    }
+
+    const latestStartInRun = Math.max(runStart, runEnd - (PlaylistSegments - 1));
+    if (latestStartInRun > bestStart) {
+      bestStart = latestStartInRun;
+    }
+  };
+
+  for (let i = 1; i < indexes.length; i++) {
+    if (indexes[i] === runEnd + 1) {
+      runEnd = indexes[i];
+      continue;
+    }
+
+    flushRun();
+    runStart = indexes[i];
+    runEnd = indexes[i];
+  }
+
+  flushRun();
+  return bestStart;
 }
 
 function firstHeaderValue(value) {
@@ -703,26 +845,139 @@ function getBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-function getLiveWindowStartSegment() {
-  const nowSegment = Math.floor(Date.now() / (SegmentDuration * 1000));
-  return Math.max(0, nowSegment - (PlaylistSegments - 1));
+function writeM3u8(res, body) {
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.apple.mpegurl',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    Pragma: 'no-cache',
+    Expires: '0',
+  });
+  res.end(body);
 }
 
-function m3u8(baseUrl, segmentIndex) {
-  let contiguousCount = 0;
-  for (let i = 0; i < PlaylistSegments; i++) {
-    if (!isSegmentReady(segmentIndex + i, activePlaylistName)) {
+function writeTs(res, body) {
+  res.writeHead(200, {
+    'Content-Type': 'video/mp2t',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+  });
+  res.end(body);
+}
+
+function normalizeNativePlaylistForSync(playlistBuffer) {
+  const source = String(playlistBuffer || '').trim();
+  if (!source) {
+    return '';
+  }
+
+  const lines = source.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const mediaSeqLine = lines.find((line) => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'));
+  const mediaSequence = mediaSeqLine
+    ? Number.parseInt(mediaSeqLine.slice('#EXT-X-MEDIA-SEQUENCE:'.length), 10)
+    : 0;
+  const targetDurationLine = lines.find((line) => line.startsWith('#EXT-X-TARGETDURATION:')) || `#EXT-X-TARGETDURATION:${SegmentDuration}`;
+  const versionLine = lines.find((line) => line.startsWith('#EXT-X-VERSION:')) || '#EXT-X-VERSION:3';
+  const hasIndependent = lines.includes('#EXT-X-INDEPENDENT-SEGMENTS');
+
+  const segments = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith('#EXTINF:')) {
+      continue;
+    }
+
+    const extinf = line;
+    let programDateTime = '';
+    let uri = '';
+    let cursor = i + 1;
+
+    while (cursor < lines.length) {
+      const candidate = lines[cursor];
+      if (candidate.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+        programDateTime = candidate;
+        cursor += 1;
+        continue;
+      }
+
+      if (candidate.startsWith('#')) {
+        break;
+      }
+
+      uri = candidate;
       break;
     }
 
-    contiguousCount++;
+    if (uri) {
+      segments.push({ extinf, programDateTime, uri });
+    }
   }
+
+  if (segments.length === 0) {
+    return source;
+  }
+
+  const keepCount = Math.max(2, SyncLiveWindowSegments);
+  const startIndex = Math.max(0, segments.length - keepCount);
+  const selected = segments.slice(startIndex);
+  const adjustedMediaSequence = mediaSequence + startIndex;
+
+  const output = [
+    '#EXTM3U',
+    versionLine,
+    targetDurationLine,
+    `#EXT-X-MEDIA-SEQUENCE:${adjustedMediaSequence}`,
+    '#EXT-X-START:TIME-OFFSET=-' + HardSyncStartOffsetSeconds.toFixed(3) + ',PRECISE=YES',
+  ];
+
+  if (hasIndependent) {
+    output.push('#EXT-X-INDEPENDENT-SEGMENTS');
+  }
+
+  for (const segment of selected) {
+    output.push(segment.extinf);
+    if (segment.programDateTime) {
+      output.push(segment.programDateTime);
+    }
+    output.push(segment.uri);
+  }
+
+  return `${output.join('\n')}\n`;
+}
+
+function getLiveWindowStartSegment() {
+  if (liveHeadSegmentIndex >= 0) {
+    return Math.max(0, liveHeadSegmentIndex - (PlaylistSegments - 1));
+  }
+
+  return findLatestReadyWindowStart(activePlaylistName);
+}
+
+function getPrefetchStartSegment() {
+  if (liveHeadSegmentIndex >= 0) {
+    return liveHeadSegmentIndex + 1;
+  }
+
+  const latestWindowStart = findLatestReadyWindowStart(activePlaylistName);
+  if (latestWindowStart >= 0) {
+    return latestWindowStart + PlaylistSegments;
+  }
+
+  return 0;
+}
+
+function m3u8(baseUrl, segmentIndex) {
+  const contiguousCount = contiguousReadyCount(segmentIndex);
 
   if (contiguousCount === 0) {
     return '';
   }
 
-  const targetDuration = SegmentDuration + 1;
+  const durations = Array.from({ length: contiguousCount }, (_, i) => {
+    const idx = segmentIndex + i;
+    const cached = segmentDurationCache.get(idx);
+    return Number.isFinite(cached) && cached > 0 ? cached : SegmentDuration;
+  });
+  const maxDuration = durations.reduce((max, value) => Math.max(max, value), SegmentDuration);
+  const targetDuration = Math.max(1, Math.ceil(maxDuration));
   let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-ALLOW-CACHE:NO\n#EXT-X-TARGETDURATION:${targetDuration}\n#EXT-X-MEDIA-SEQUENCE:${segmentIndex}\n`;
 
   for (let i = 0; i < contiguousCount; i++) {
@@ -734,7 +989,8 @@ function m3u8(baseUrl, segmentIndex) {
     const segmentPath = activePlaylistName
       ? `/live/${activePlaylistName}/segment-${idx}.ts`
       : `/live/segment-${idx}.ts`;
-    playlist += `#EXTINF:${SegmentDuration.toFixed(3)},\n${baseUrl}${segmentPath}\n`;
+    const extinf = durations[i];
+    playlist += `#EXTINF:${extinf.toFixed(3)},\n${baseUrl}${segmentPath}\n`;
   }
 
   return playlist;
@@ -774,18 +1030,13 @@ function playlistNameFromSegmentPath(pathname) {
 }
 
 function tick() {
-  // Request-driven mode: synthetic playback clock disabled.
 }
 
 function startPlayback(resetTime = false) {
   if (resetTime) {
-    playbackTime = 0;
     cachedTotalDuration = 0;
     cachedVideoTimeline = Array();
   }
-
-  manifestBaseSegment = 0;
-  highestRequestedSegment = -1;
 
   if (isRunning) {
     return;
@@ -802,7 +1053,20 @@ const server = http.createServer(async (req, res) => {
   }
 
   const { pathname } = new URL(req.url, `http://${req.headers.host}`);
-  log('info', 'Incoming request', { method: req.method, pathname });
+  if (pathname === '/live/stream.m3u8') {
+    streamPlaylistPollCount += 1;
+    const now = Date.now();
+    if (now - lastStreamPlaylistPollLogAt >= 2000) {
+      log('info', 'Incoming stream playlist poll summary', {
+        polls: streamPlaylistPollCount,
+        windowMs: now - lastStreamPlaylistPollLogAt,
+      });
+      streamPlaylistPollCount = 0;
+      lastStreamPlaylistPollLogAt = now;
+    }
+  } else {
+    log('info', 'Incoming request', { method: req.method, pathname });
+  }
 
   if (pathname === '/live/stream.m3u8' || pathname === '/live/master.m3u8') {
     if (UseNativeHls) {
@@ -814,13 +1078,11 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      res.writeHead(200, {
-        'Content-Type': 'application/vnd.apple.mpegurl',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        Pragma: 'no-cache',
-        Expires: '0',
-      });
-      res.end(fs.readFileSync(playlistPath));
+      const nativePlaylist = fs.readFileSync(playlistPath, 'utf8');
+      const responsePlaylist = EnableNativePlaylistSyncRewrite
+        ? normalizeNativePlaylistForSync(nativePlaylist)
+        : nativePlaylist;
+      writeM3u8(res, responsePlaylist);
       return;
     }
 
@@ -828,36 +1090,30 @@ const server = http.createServer(async (req, res) => {
       const playlistNames = discoverPlaylistNames();
       if (playlistNames.length === 0) {
         activatePlaylist('');
-        const segmentIndex = getLiveWindowStartSegment();
-        manifestBaseSegment = segmentIndex;
+        const desiredSegmentIndex = getLiveWindowStartSegment();
+        const prefetchStart = getPrefetchStartSegment();
         if (HasFfmpeg && HasFfprobe) {
-          await ensureContiguousWindow(segmentIndex, PlaylistSegments + 2);
+          prefetchContiguousWindow(prefetchStart, PlaylistSegments + 2);
         }
 
-        const playlist = m3u8(getBaseUrl(req), segmentIndex);
+        let playlist = m3u8(getBaseUrl(req), desiredSegmentIndex);
+        if (!playlist) {
+          const fallbackStart = findLatestReadyWindowStart();
+          if (fallbackStart >= 0) {
+            playlist = m3u8(getBaseUrl(req), fallbackStart);
+          }
+        }
         if (!playlist) {
           res.statusCode = 503;
           res.end('Warming up segments, retry in a moment');
           return;
         }
 
-        res.writeHead(200, {
-          'Content-Type': 'application/vnd.apple.mpegurl',
-          'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-          Pragma: 'no-cache',
-          Expires: '0',
-        });
-        res.end(playlist);
+        writeM3u8(res, playlist);
         return;
       }
 
-      res.writeHead(200, {
-        'Content-Type': 'application/vnd.apple.mpegurl',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        Pragma: 'no-cache',
-        Expires: '0',
-      });
-      res.end(masterM3u8(getBaseUrl(req)));
+      writeM3u8(res, masterM3u8(getBaseUrl(req)));
       return;
     }
   }
@@ -873,7 +1129,7 @@ const server = http.createServer(async (req, res) => {
     activatePlaylist(playlistName);
     const videos = listVideoFiles();
     const videoCount = videos.length;
-    log('info', 'Requested playlist', { pathname, playlistName, videoCount, videos, ffmpegAvailable: HasFfmpeg, playbackTime });
+    log('info', 'Requested playlist', { pathname, playlistName, videoCount, videos, ffmpegAvailable: HasFfmpeg });
     if (videoCount === 0) {
       res.statusCode = 404;
       res.end('No videos available');
@@ -881,25 +1137,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     const segmentIndex = getLiveWindowStartSegment();
-    manifestBaseSegment = segmentIndex;
+    const prefetchStart = getPrefetchStartSegment();
     if (HasFfmpeg && HasFfprobe) {
-      await ensureContiguousWindow(segmentIndex, PlaylistSegments + 2);
+      prefetchContiguousWindow(prefetchStart, PlaylistSegments + 2);
     }
 
-    const playlist = m3u8(getBaseUrl(req), segmentIndex);
+    let playlist = m3u8(getBaseUrl(req), segmentIndex);
+    if (!playlist) {
+      const fallbackStart = findLatestReadyWindowStart(activePlaylistName);
+      if (fallbackStart >= 0) {
+        playlist = m3u8(getBaseUrl(req), fallbackStart);
+      }
+    }
     if (!playlist) {
       res.statusCode = 503;
-      res.end('Warming up segments, retry in a moment');
+      res.end('Warming up segments');
       return;
     }
 
-    res.writeHead(200, {
-      'Content-Type': 'application/vnd.apple.mpegurl',
-      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-      Pragma: 'no-cache',
-      Expires: '0',
-    });
-    res.end(playlist);
+    writeM3u8(res, playlist);
     return;
   }
 
@@ -914,11 +1170,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      res.writeHead(200, {
-        'Content-Type': 'video/mp2t',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-      });
-      res.end(fs.readFileSync(segmentFile));
+      writeTs(res, fs.readFileSync(segmentFile));
       return;
     }
     if (!HasFfmpeg || !HasFfprobe) {
@@ -927,13 +1179,12 @@ const server = http.createServer(async (req, res) => {
         ffprobeAvailable: HasFfprobe,
       });
       res.statusCode = 503;
-      res.end('FFmpeg/ffprobe is not installed on this server');
+      res.end('FFmpeg/ffprobe is not installed! Please install it.');
       return;
     }
     const match = pathname.match(/\d+/);
     const segmentIndex = Number.parseInt(match ? match[0] : '0', 10);
     const segmentFile = segmentFilePath(segmentIndex, activePlaylistName);
-    highestRequestedSegment = Math.max(highestRequestedSegment, segmentIndex);
     const exists = fs.existsSync(segmentFile);
     const healthy = isSegmentHealthy(segmentIndex, activePlaylistName);
     if (!exists || !healthy) {
@@ -952,24 +1203,15 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
-    res.writeHead(200, {
-      'Content-Type': 'video/mp2t',
-      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-    });
-    res.end(fs.readFileSync(segmentFile));
+    writeTs(res, fs.readFileSync(segmentFile));
     return;
   }
   res.statusCode = 404;
-  res.end('Not found');
+  res.end('Not found!');
 });
 server.listen(ServePort, () => {
   clearLiveSegments();
-  log('info', 'Server started', {
-    port: ServePort,
-    basehost: process.env.basehost || '(not set)',
-    ffmpegAvailable: HasFfmpeg,
-    ffprobeAvailable: HasFfprobe,
-    mediaDir: VidsDir,
+  log('info', '[(=|]', {
     videoFiles: listVideoFiles(),
   });
   if (UseNativeHls) {
@@ -980,8 +1222,8 @@ server.listen(ServePort, () => {
       void preGenerateFromIndex(0, StartupWarmupSegments);
     }
   }
-  log('info', 'hi');
+  log('info', 'started');
 });
 server.on('error', (err) => {
-  log('error', 'Server error', { message: err.message, code: err.code });
+  log('error', 'internal error', { message: err.message, code: err.code });
 });
