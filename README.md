@@ -21,4 +21,4 @@ How many newest segments to keep in rewritten playlist.
 
 hardSyncStartOffsetSeconds -
 Only used when enableNativePlaylistSyncRewrite=1.
-Adds an HLS start offset so clients begin near the same point in the vod (for the vine)
+Adds an HLS start offset so clients begin near the same point in the player

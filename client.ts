@@ -1,43 +1,35 @@
-// @ts-nocheck
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
-
 let ffmpegStaticPath = '';
 let ffprobeStaticPath = '';
-
 try {
   ffmpegStaticPath = require('ffmpeg-static') || '';
 } catch {
   ffmpegStaticPath = '';
 }
-
 try {
   const ffprobeStatic = require('ffprobe-static');
   ffprobeStaticPath = ffprobeStatic && ffprobeStatic.path ? ffprobeStatic.path : '';
 } catch {
   ffprobeStaticPath = '';
 }
-
 function loadEnvFile() {
   const envPath = path.join(process.cwd(), '.env');
   if (!fs.existsSync(envPath)) {
     return;
   }
-
   const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) {
       continue;
     }
-
     const eqIndex = trimmed.indexOf('=');
     if (eqIndex <= 0) {
       continue;
     }
-
     const key = trimmed.slice(0, eqIndex).trim();
     const value = trimmed.slice(eqIndex + 1).trim();
     if (key && process.env[key] === undefined) {
@@ -45,9 +37,7 @@ function loadEnvFile() {
     }
   }
 }
-
 loadEnvFile();
-
 function buildRuntimeEnv() {
   const runtimeEnv = { ...process.env };
   const existingPath = runtimeEnv.Path || runtimeEnv.PATH || '';
@@ -61,36 +51,33 @@ function buildRuntimeEnv() {
     runtimeEnv.PATH = mergedPath;
     return runtimeEnv;
   }
-
   runtimeEnv.PATH = existingPath;
   return runtimeEnv;
 }
-
 const RuntimeEnv = buildRuntimeEnv();
-const FfmpegCommand = process.env.ffmpegPath || process.env.FFMPEG_PATH || ffmpegStaticPath || 'ffmpeg';
-const FfprobeCommand = process.env.ffprobePath || process.env.FFPROBE_PATH || ffprobeStaticPath || 'ffprobe';
+const FfmpegCommand = process.env.ffmpegPath || ffmpegStaticPath || 'ffmpeg';
+const FfprobeCommand = process.env.ffprobePath || ffprobeStaticPath || 'ffprobe';
 
 function commandAvailable(command) {
   const check = spawnSync(command, ['-version'], { stdio: 'ignore', env: RuntimeEnv });
   return !check.error && check.status === 0;
 }
-
 const ServePort = 5181;
 const VidsDir = path.join(process.cwd(), 'media');
 const OutputDir = path.join(process.cwd(), 'live');
-const SegmentDuration = Math.max(1, Number.parseInt(process.env.segmentDuration || process.env.SEGMENT_DURATION || '4', 10) || 4);
+const SegmentDuration = Math.max(1, Number.parseInt(process.env.segmentDuration || '4', 10) || 4);
 const PlaylistSegments = 6;
-const NativeHlsListSize = Math.max(3, Number.parseInt(process.env.nativeHlsListSize || process.env.NATIVE_HLS_LIST_SIZE || `${PlaylistSegments + 3}`, 10) || (PlaylistSegments + 3));
+const NativeHlsListSize = Math.max(3, Number.parseInt(process.env.nativeHlsListSize || `${PlaylistSegments + 3}`, 10) || (PlaylistSegments + 3));
 const StartupWarmupSegments = 10;
 const MinSegmentBytes = 4096;
-const UseNativeHls = (process.env.useNativeHls || process.env.USE_NATIVE_HLS || '1') !== '0';
-const EnableProgramDateTime = (process.env.hlsProgramDateTime || process.env.HLS_PROGRAM_DATE_TIME || '0') === '1';
+const UseNativeHls = (process.env.useNativeHls || '1') !== '0';
+const EnableProgramDateTime = (process.env.hlsProgramDateTime || '0') === '1';
 const EnableNativePlaylistSyncRewrite = (process.env.enableNativePlaylistSyncRewrite || '0') === '1';
 const UseMasterPlaylist = true;
 const PublicBaseUrl = process.env.basehost?.replace(/\/+$/, '');
 const HasFfmpeg = commandAvailable(FfmpegCommand);
 const HasFfprobe = commandAvailable(FfprobeCommand);
-const SegmentQueueConcurrency = Math.max(1, Number.parseInt(process.env.segmentQueueConcurrency || process.env.SEGMENT_QUEUE_CONCURRENCY || '2', 10) || 2);
+const SegmentQueueConcurrency = Math.max(1, Number.parseInt(process.env.segmentQueueConcurrency || '2', 10) || 2);
 const SyncLiveWindowSegments = Math.max(2, Number.parseInt(process.env.syncLiveWindowSegments || '3', 10) || 3);
 const HardSyncStartOffsetSeconds = Math.max(
   0.5,
@@ -123,12 +110,10 @@ function log(level, message, ...meta) {
 
   sink(`[stream ${stamp}] ${message}`);
 }
-
 async function getSegmentQueue() {
   if (pQueueInstancePromise) {
     return pQueueInstancePromise;
   }
-
   pQueueInstancePromise = import('p-queue')
     .then((mod) => {
       const PQueue = mod.default;
