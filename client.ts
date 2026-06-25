@@ -128,7 +128,6 @@ async function getSegmentQueue() {
 
   return pQueueInstancePromise;
 }
-
 function runFallbackQueued(task) {
   return new Promise((resolve, reject) => {
     fallbackSegmentQueue.pending.push({ task, resolve, reject });
