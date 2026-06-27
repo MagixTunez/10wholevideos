@@ -83,14 +83,33 @@ function parseSegmentIndexFromPath(pathname) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-async function waitForSegmentFileReady(filePath, timeoutMs = 2500) {
+async function waitForSegmentFileReady(filePath, timeoutMs = 8000) {
   const started = Date.now();
+  // For native HLS, ffmpeg only adds a segment to stream.m3u8 once it has
+  // finished writing that segment and moved on to the next. Checking the
+  // playlist is the only reliable way to know a segment is fully flushed.
+  const segMatch = UseNativeHls ? filePath.match(/segment-(\d+)\.ts$/) : null;
+  const segTag = segMatch ? `segment-${segMatch[1]}.ts` : null;
+  const playlistPath = segTag ? path.join(path.dirname(filePath), 'stream.m3u8') : null;
+
   while (Date.now() - started < timeoutMs) {
     if (fs.existsSync(filePath)) {
       try {
         const stats = fs.statSync(filePath);
         if (stats.size > 0) {
-          return true;
+          if (playlistPath && segTag) {
+            try {
+              const playlist = fs.readFileSync(playlistPath, 'utf8');
+              if (playlist.includes(segTag)) {
+                return true;
+              }
+              // File exists but not yet in playlist — still being written, keep waiting
+            } catch {
+              return true; // Can't read playlist, fall back to size check
+            }
+          } else {
+            return true;
+          }
         }
       } catch {
       }

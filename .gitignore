@@ -2,3 +2,4 @@ live/
 node_modules/
 media/
 .env
+webs/
