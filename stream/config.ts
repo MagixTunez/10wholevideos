@@ -75,8 +75,8 @@ const ServePort = 5181;
 const VidsDir = path.join(process.cwd(), 'media');
 const OutputDir = path.join(process.cwd(), 'live');
 const SegmentDuration = Math.max(1, Number.parseInt(process.env.segmentDuration || '4', 10) || 4);
-const PlaylistSegments = 6;
-const NativeHlsListSize = Math.max(3, Number.parseInt(process.env.nativeHlsListSize || `${PlaylistSegments + 3}`, 10) || (PlaylistSegments + 3));
+const PlaylistSegments = Math.max(6, Number.parseInt(process.env.playlistSegments || '12', 10) || 12);
+const NativeHlsListSize = Math.max(8, Number.parseInt(process.env.nativeHlsListSize || `${PlaylistSegments + 6}`, 10) || (PlaylistSegments + 6));
 const StartupWarmupSegments = 10;
 const MinSegmentBytes = 4096;
 const UseNativeHls = (process.env.useNativeHls || '0') !== '0';
@@ -89,10 +89,10 @@ const FfprobeCommand = process.env.ffprobePath || ffprobeStaticPath || 'ffprobe'
 const Checkff = commandAvailable(FfmpegCommand, RuntimeEnv);
 const Checkprobe = commandAvailable(FfprobeCommand, RuntimeEnv);
 const SegmentQueueConcurrency = Math.max(1, Number.parseInt(process.env.segmentQueueConcurrency || '2', 10) || 2);
-const SyncLiveWindowSegments = Math.max(2, Number.parseInt(process.env.syncLiveWindowSegments || '3', 10) || 3);
+const SyncLiveWindowSegments = Math.max(3, Number.parseInt(process.env.syncLiveWindowSegments || '5', 10) || 5);
 const HardSyncStartOffsetSeconds = Math.max(
   0.5,
-  Number.parseFloat(process.env.hardSyncStartOffsetSeconds || `${Math.max(1, SegmentDuration * 1.25)}`) || Math.max(1, SegmentDuration * 1.25)
+  Number.parseFloat(process.env.hardSyncStartOffsetSeconds || `${Math.max(2, SegmentDuration * 2)}`) || Math.max(2, SegmentDuration * 2)
 );
 
 module.exports = {

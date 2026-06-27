@@ -16,89 +16,131 @@ const {
 } = require('./config.ts');
 const { state } = require('./state.ts');
 const { log } = require('./logger.ts');
-const { listVideoFiles, clearLiveSegments, writeConcatFile } = require('./media.ts');
+const { listVideoFiles, mediaDirForPlaylist } = require('./media.ts');
+
+let nativeHlsNextSegmentNumber = 0;
+
+function updateNextSegmentNumber(playlistPath) {
+  try {
+    if (!fs.existsSync(playlistPath)) return;
+    const content = fs.readFileSync(playlistPath, 'utf8');
+    const seqMatch = content.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+    if (!seqMatch) return;
+    const mediaSeq = Number.parseInt(seqMatch[1], 10);
+    const segCount = (content.match(/#EXTINF:/g) || []).length;
+    nativeHlsNextSegmentNumber = mediaSeq + segCount;
+  } catch {
+  }
+}
 
 function startNativeHlsPipeline() {
   if (!UseNativeHls || state.nativeHlsProcess || !Checkff) {
     return;
   }
 
-  const videos = listVideoFiles();
+  const videos = listVideoFiles().sort();
   if (videos.length === 0) {
     log('warn', 'Native HLS pipeline not started because no videos were found');
     return;
   }
 
-  clearLiveSegments();
-  const concatPath = writeConcatFile();
+  const videoFilePaths = videos.map((f) =>
+    path.join(mediaDirForPlaylist(state.activePlaylistName), f)
+  );
+
   const playlistPath = path.join(OutputDir, 'stream.m3u8');
   const segmentPattern = path.join(OutputDir, 'segment-%d.ts');
+  const fps = 30;
+  const gop = Math.max(1, SegmentDuration * fps);
   const nativeHlsFlags = EnableProgramDateTime
-    ? 'delete_segments+append_list+independent_segments+program_date_time'
-    : 'delete_segments+append_list+independent_segments';
+    ? 'independent_segments+program_date_time+omit_endlist'
+    : 'independent_segments+omit_endlist';
+
+  // Each file is passed as a direct -i input (not through the concat demuxer) so
+  // that each gets its own MP4 demuxer which correctly handles AVCC h264 and
+  // non-standard AAC. We repeat the playlist repeatCount times then auto-restart.
+  const repeatCount = 20;
+  const nFiles = videoFilePaths.length;
+  const totalSegments = nFiles * repeatCount;
+
+  const inputArgs = [];
+  for (let r = 0; r < repeatCount; r++) {
+    for (const fp of videoFilePaths) {
+      inputArgs.push('-i', fp);
+    }
+  }
+
+  // Scale each input to the same size BEFORE concat (concat requires uniform dimensions).
+  const perInputFilters = [];
+  let concatInputs = '';
+  for (let i = 0; i < totalSegments; i++) {
+    perInputFilters.push(
+      `[${i}:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,fps=fps=${fps}[v${i}]`
+    );
+    perInputFilters.push(
+      `[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`
+    );
+    concatInputs += `[v${i}][a${i}]`;
+  }
+  const filterComplex = [
+    ...perInputFilters,
+    `${concatInputs}concat=n=${totalSegments}:v=1:a=1[v][a]`,
+  ].join(';');
 
   const proc = spawn(FfmpegCommand, [
     '-y',
-    '-re',
-    '-stream_loop',
-    '-1',
-    '-f',
-    'concat',
-    '-safe',
-    '0',
-    '-i',
-    concatPath,
-    '-vf',
-    'scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2',
-    '-r',
-    '30',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'ultrafast',
-    '-profile:v',
-    'baseline',
-    '-level',
-    '3.1',
-    '-g',
-    '60',
-    '-keyint_min',
-    '60',
-    '-sc_threshold',
-    '0',
-    '-c:a',
-    'aac',
-    '-ar',
-    '48000',
-    '-ac',
-    '2',
-    '-b:a',
-    '128k',
-    '-f',
-    'hls',
-    '-hls_time',
-    `${SegmentDuration}`,
-    '-hls_list_size',
-    `${NativeHlsListSize}`,
-    '-hls_flags',
-    nativeHlsFlags,
-    '-hls_delete_threshold',
-    '2',
-    '-hls_segment_filename',
-    segmentPattern,
+    ...inputArgs,
+    '-filter_complex', filterComplex,
+    '-map', '[v]',
+    '-map', '[a]',
+    '-pix_fmt', 'yuv420p',
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-profile:v', 'baseline',
+    '-level', '3.1',
+    '-g', `${gop}`,
+    '-keyint_min', `${gop}`,
+    '-sc_threshold', '0',
+    '-force_key_frames', `expr:gte(t,n_forced*${SegmentDuration})`,
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-avoid_negative_ts', 'make_zero',
+    '-f', 'hls',
+    '-hls_time', `${SegmentDuration}`,
+    '-hls_list_size', `${NativeHlsListSize}`,
+    '-hls_flags', nativeHlsFlags,
+    '-start_number', `${nativeHlsNextSegmentNumber}`,
+    '-hls_delete_threshold', '10',
+    '-hls_segment_filename', segmentPattern,
     playlistPath,
   ], { env: RuntimeEnv });
 
   state.nativeHlsProcess = proc;
+  let lastNativeStderr = '';
 
-  proc.stderr.on('data', () => {
+  proc.stderr.on('data', (chunk) => {
+    const text = String(chunk || '');
+    if (!text) {
+      return;
+    }
+
+    const merged = (lastNativeStderr + text).split(/\r?\n/);
+    lastNativeStderr = merged.slice(-6).join('\n');
+
+    const lowered = text.toLowerCase();
+    if (lowered.includes('error') || lowered.includes('failed') || lowered.includes('invalid') || lowered.includes('could not') || lowered.includes('no such file')) {
+      log('warn', 'ffmpeg native hls stderr', { message: text.trim() });
+    }
   });
 
   proc.on('close', (code) => {
-    log('warn', 'Native HLS pipeline exited', { code });
+    if (code !== 0 && lastNativeStderr) {
+      log('warn', 'Native HLS pipeline stderr before exit', { code, stderr: lastNativeStderr });
+    }
+    log('info', 'Native HLS pipeline exited, restarting', { code });
+    updateNextSegmentNumber(playlistPath);
     state.nativeHlsProcess = null;
+    setTimeout(() => startNativeHlsPipeline(), 500);
   });
 
   proc.on('error', (err) => {
@@ -108,6 +150,8 @@ function startNativeHlsPipeline() {
 
   log('info', 'Native HLS pipeline started', {
     videos: videos.length,
+    repeatCount,
+    totalSegments,
     playlistPath,
     nativeHlsFlags,
   });

@@ -83,6 +83,25 @@ function parseSegmentIndexFromPath(pathname) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+async function waitForSegmentFileReady(filePath, timeoutMs = 2500) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (fs.existsSync(filePath)) {
+      try {
+        const stats = fs.statSync(filePath);
+        if (stats.size > 0) {
+          return true;
+        }
+      } catch {
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
+
+  return false;
+}
+
 async function ensurePlaylistWarmup(startIndex) {
   const safeStart = Math.max(0, Number.isInteger(startIndex) ? startIndex : 0);
   await ensureSegment(safeStart);
@@ -239,12 +258,21 @@ function createServer() {
       activatePlaylist(playlistName, () => startPlayback(true));
       if (UseNativeHls) {
         const segmentFile = path.join(OutputDir, pathname.slice('/live/'.length));
-        if (!fs.existsSync(segmentFile)) {
+        const ready = await waitForSegmentFileReady(segmentFile);
+        if (!ready) {
           res.statusCode = 404;
           res.end('Segment not found');
           return;
         }
-        writeTs(res, fs.readFileSync(segmentFile));
+
+        try {
+          writeTs(res, fs.readFileSync(segmentFile));
+        } catch (err) {
+          const message = err && typeof err === 'object' ? Reflect.get(err, 'message') : String(err);
+          log('warn', 'Failed reading native segment file', { segmentFile, error: message });
+          res.statusCode = 503;
+          res.end('Segment warming up');
+        }
         return;
       }
       if (!Checkff || !Checkprobe) {

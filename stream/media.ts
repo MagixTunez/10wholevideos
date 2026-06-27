@@ -85,12 +85,12 @@ function playlistExists(name) {
 
 function writeConcatFile() {
   const concatPath = path.join(OutputDir, 'concat.txt');
-  const lines = listVideoFiles()
+  const fileLines = listVideoFiles()
     .sort()
     .map((file) => `file '${path.join(mediaDirForPlaylist(state.activePlaylistName), file).replace(/\\/g, '/')}'`)
     .join('\n');
 
-  fs.writeFileSync(concatPath, lines, 'utf8');
+  fs.writeFileSync(concatPath, `ffconcat version 1.0\n${fileLines}\n`, 'utf8');
   return concatPath;
 }
 function segmentFilePath(segmentIndex, playlistName = state.activePlaylistName) {
@@ -222,12 +222,11 @@ function m3u8(baseUrl, segmentIndex) {
   });
   const maxDuration = durations.reduce((max, value) => Math.max(max, value), SegmentDuration);
   const targetDuration = Math.max(1, Math.ceil(maxDuration));
-  const startOffset = Math.max(1, SegmentDuration * 1.25).toFixed(3);
+  const startOffset = Math.max(SegmentDuration * 2, SegmentDuration * 3).toFixed(3);
   let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-ALLOW-CACHE:NO\n#EXT-X-TARGETDURATION:${targetDuration}\n#EXT-X-MEDIA-SEQUENCE:${segmentIndex}\n#EXT-X-START:TIME-OFFSET=-${startOffset},PRECISE=YES\n`;
 
   for (let i = 0; i < contiguousCount; i++) {
     const idx = segmentIndex + i;
-
     const segmentPath = state.activePlaylistName
       ? `/live/${state.activePlaylistName}/segment-${idx}.ts`
       : `/live/segment-${idx}.ts`;
