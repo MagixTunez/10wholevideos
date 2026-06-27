@@ -54,6 +54,9 @@ function writeM3u8(res, body) {
     'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
     'Pragma': 'no-cache',
     'Expires': '0',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
+    'Access-Control-Allow-Headers': '*',
   });
   res.end(body);
 }
@@ -61,8 +64,29 @@ function writeTs(res, body) {
   res.writeHead(200, {
     'Content-Type': 'video/mp2t',
     'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+    'Accept-Ranges': 'bytes',
+    'Content-Length': Buffer.byteLength(body),
   });
   res.end(body);
+}
+
+function parseSegmentIndexFromPath(pathname) {
+  const match = pathname.match(/segment-(\d+)\.ts$/);
+  if (!match) {
+    return null;
+  }
+
+  const value = Number.parseInt(match[1], 10);
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+async function ensurePlaylistWarmup(startIndex) {
+  const safeStart = Math.max(0, Number.isInteger(startIndex) ? startIndex : 0);
+  await ensureSegment(safeStart);
+  await ensureSegment(safeStart + 1);
 }
 
 function createServer() {
@@ -70,6 +94,16 @@ function createServer() {
     if (!req.url || !req.headers.host) {
       res.statusCode = 400;
       res.end('Bad Request');
+      return;
+    }
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+      });
+      res.end();
       return;
     }
 
@@ -89,7 +123,7 @@ function createServer() {
       log('info', 'Incoming request', { method: req.method, pathname });
     }
 
-    if (pathname === '/live/stream.m3u8' || pathname === '/live/master.m3u8') {
+    if (pathname === '/live/stream.m3u8') {
       if (UseNativeHls) {
         startNativeHlsPipeline();
         const playlistPath = path.join(OutputDir, 'stream.m3u8');
@@ -105,30 +139,51 @@ function createServer() {
         writeM3u8(res, responsePlaylist);
         return;
       }
-      if (UseMasterPlaylist) {
-        const playlistNames = discoverPlaylistNames();
-        if (playlistNames.length === 0) {
-          activatePlaylist('', () => startPlayback(true));
-          const desiredSegmentIndex = getLiveWindowStartSegment();
-          const prefetchStart = getPrefetchStartSegment();
-          if (Checkff && Checkprobe) {
-            prefetchContiguousWindow(prefetchStart, PlaylistSegments + 2);
+      activatePlaylist('', () => startPlayback(true));
+      const desiredSegmentIndex = getLiveWindowStartSegment();
+      const prefetchStart = getPrefetchStartSegment();
+      if (Checkff && Checkprobe) {
+        prefetchContiguousWindow(prefetchStart, PlaylistSegments + 2);
+      }
+      let playlist = m3u8(getBaseUrl(req), desiredSegmentIndex);
+      if (!playlist) {
+        if (Checkff && Checkprobe) {
+          try {
+            await ensurePlaylistWarmup(desiredSegmentIndex);
+          } catch {
           }
-          let playlist = m3u8(getBaseUrl(req), desiredSegmentIndex);
-          if (!playlist) {
-            const fallbackStart = findLatestReadyWindowStart();
-            if (fallbackStart >= 0) {
-              playlist = m3u8(getBaseUrl(req), fallbackStart);
-            }
-          }
-          if (!playlist) {
-            res.statusCode = 503;
-            res.end('Warming up segments, retry in a moment');
-            return;
-          }
-          writeM3u8(res, playlist);
+          playlist = m3u8(getBaseUrl(req), Math.max(0, desiredSegmentIndex));
+        }
+      }
+      if (!playlist) {
+        const fallbackStart = findLatestReadyWindowStart();
+        if (fallbackStart >= 0) {
+          playlist = m3u8(getBaseUrl(req), fallbackStart);
+        }
+      }
+      if (!playlist) {
+        res.statusCode = 503;
+        res.end('Warming up segments, retry in a moment');
+        return;
+      }
+      writeM3u8(res, playlist);
+      return;
+    }
+
+    if (pathname === '/live/master.m3u8') {
+      if (UseNativeHls) {
+        startNativeHlsPipeline();
+        const playlistPath = path.join(OutputDir, 'stream.m3u8');
+        if (!fs.existsSync(playlistPath) || fs.statSync(playlistPath).size === 0) {
+          res.statusCode = 503;
+          res.end('Warming up HLS pipeline, retry in a moment');
           return;
         }
+        writeM3u8(res, fs.readFileSync(playlistPath, 'utf8'));
+        return;
+      }
+
+      if (UseMasterPlaylist) {
         writeM3u8(res, masterM3u8(getBaseUrl(req)));
         return;
       }
@@ -156,6 +211,15 @@ function createServer() {
       }
 
       let playlist = m3u8(getBaseUrl(req), segmentIndex);
+      if (!playlist) {
+        if (Checkff && Checkprobe) {
+          try {
+            await ensurePlaylistWarmup(segmentIndex);
+          } catch {
+          }
+          playlist = m3u8(getBaseUrl(req), Math.max(0, segmentIndex));
+        }
+      }
       if (!playlist) {
         const fallbackStart = findLatestReadyWindowStart(state.activePlaylistName);
         if (fallbackStart >= 0) {
@@ -192,12 +256,31 @@ function createServer() {
         res.end('FFmpeg/ffprobe is not installed! Please install it.');
         return;
       }
-      const match = pathname.match(/\d+/);
-      const segmentIndex = Number.parseInt(match ? match[0] : '0', 10);
+      const segmentIndex = parseSegmentIndexFromPath(pathname);
+      if (segmentIndex === null) {
+        res.statusCode = 400;
+        res.end('Invalid segment path');
+        return;
+      }
       const segmentFile = segmentFilePath(segmentIndex, state.activePlaylistName);
       const exists = fs.existsSync(segmentFile);
       const healthy = isSegmentHealthy(segmentIndex, state.activePlaylistName);
       if (!exists || !healthy) {
+        const liveHead = state.liveHeadSegmentIndex;
+        const liveStart = getLiveWindowStartSegment();
+        const referenceHead = Math.max(liveHead, liveStart + (PlaylistSegments - 1));
+        const maxForwardJump = PlaylistSegments + 8;
+        if (referenceHead >= 0 && segmentIndex > referenceHead + maxForwardJump) {
+          log('warn', 'Ignoring far-ahead segment request', {
+            segmentIndex,
+            referenceHead,
+            maxAllowed: referenceHead + maxForwardJump,
+          });
+          res.statusCode = 404;
+          res.end('Segment not found');
+          return;
+        }
+
         log('info', 'Segment requested but missing/unhealthy; generating', {
           segmentIndex,
           segmentFile,

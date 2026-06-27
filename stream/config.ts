@@ -79,7 +79,7 @@ const PlaylistSegments = 6;
 const NativeHlsListSize = Math.max(3, Number.parseInt(process.env.nativeHlsListSize || `${PlaylistSegments + 3}`, 10) || (PlaylistSegments + 3));
 const StartupWarmupSegments = 10;
 const MinSegmentBytes = 4096;
-const UseNativeHls = (process.env.useNativeHls || '1') !== '0';
+const UseNativeHls = (process.env.useNativeHls || '0') !== '0';
 const EnableProgramDateTime = (process.env.hlsProgramDateTime || '0') === '1';
 const EnableNativePlaylistSyncRewrite = (process.env.enableNativePlaylistSyncRewrite || '0') === '1';
 const UseMasterPlaylist = true;

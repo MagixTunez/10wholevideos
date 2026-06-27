@@ -35,7 +35,7 @@ function getVideoTimeline() {
     return state.cachedVideoTimeline;
   }
 
-  const files = listVideoFiles().map((fileName) => ({
+  const files = listVideoFiles().sort().map((fileName) => ({
     fileName,
     filePath: path.join(mediaDirForPlaylist(state.activePlaylistName), fileName),
   }));
@@ -122,6 +122,14 @@ function getTotalDurationSeconds() {
 
 function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
   return new Promise((resolve) => {
+    const tempSegmentFile = `${segmentFile}.part`;
+    try {
+      if (fs.existsSync(tempSegmentFile)) {
+        fs.rmSync(tempSegmentFile, { force: true });
+      }
+    } catch {
+    }
+
     const ffmpeg = spawn(FfmpegCommand, [
       '-y',
       '-fflags',
@@ -130,6 +138,12 @@ function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
       `${sourceOffset}`,
       '-i',
       sourcePath,
+      '-map',
+      '0:v:0',
+      '-map',
+      '0:a:0',
+      '-sn',
+      '-dn',
       '-t',
       `${SegmentDuration}`,
       '-avoid_negative_ts',
@@ -162,17 +176,15 @@ function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
       '2',
       '-b:a',
       '128k',
+      '-af',
+      'aresample=async=1:first_pts=0',
       '-muxpreload',
       '0',
       '-muxdelay',
       '0',
-      '-mpegts_flags',
-      '+initial_discontinuity',
-      '-reset_timestamps',
-      '1',
       '-f',
       'mpegts',
-      segmentFile,
+      tempSegmentFile,
     ], { env: RuntimeEnv });
 
     let stderr = '';
@@ -185,7 +197,27 @@ function runFfmpegToSegment(sourcePath, sourceOffset, segmentFile) {
     });
 
     ffmpeg.on('close', (code) => {
-      const ok = code === 0 && fs.existsSync(segmentFile) && fs.statSync(segmentFile).size > 0;
+      let ok = false;
+      if (code === 0 && fs.existsSync(tempSegmentFile) && fs.statSync(tempSegmentFile).size > 0) {
+        try {
+          if (fs.existsSync(segmentFile)) {
+            fs.rmSync(segmentFile, { force: true });
+          }
+          fs.renameSync(tempSegmentFile, segmentFile);
+          ok = fs.existsSync(segmentFile) && fs.statSync(segmentFile).size > 0;
+        } catch (err) {
+          stderr += `\nrename failed: ${err && typeof err === 'object' ? Reflect.get(err, 'message') : String(err)}`;
+          ok = false;
+        }
+      }
+
+      if (fs.existsSync(tempSegmentFile)) {
+        try {
+          fs.rmSync(tempSegmentFile, { force: true });
+        } catch {
+        }
+      }
+
       resolve({ ok, code, stderr });
     });
   });
@@ -257,9 +289,19 @@ function generateSegment(segmentIndex) {
 
   const timeline = getVideoTimeline();
   const maxOffset = Math.max(0, target.sourceDuration - 0.25);
-  const selectedPath = target.filePath;
-  const selectedName = target.fileName;
-  const safeOffset = Math.min(target.localOffset, maxOffset);
+  let selectedPath = target.filePath;
+  let selectedName = target.fileName;
+  let safeOffset = Math.min(target.localOffset, maxOffset);
+
+  const remainingInSource = target.sourceDuration - safeOffset;
+  const minimumUsefulSlice = Math.max(1, SegmentDuration * 0.75);
+  if (remainingInSource < minimumUsefulSlice && timeline.length > 1) {
+    const nextIndex = (target.timelineIndex + 1) % timeline.length;
+    const next = timeline[nextIndex];
+    selectedPath = next.filePath;
+    selectedName = next.fileName;
+    safeOffset = 0;
+  }
 
   return new Promise(async (resolve, reject) => {
     log('info', 'Generating segment', {
@@ -282,21 +324,25 @@ function generateSegment(segmentIndex) {
       if (generatedDuration > 0) {
         state.segmentDurationCache.set(segmentIndex, generatedDuration);
       }
-      state.liveHeadSegmentIndex = Math.max(state.liveHeadSegmentIndex, segmentIndex);
+      const maxForwardJump = PlaylistSegments + 8;
+      if (state.liveHeadSegmentIndex < 0 || segmentIndex <= state.liveHeadSegmentIndex + maxForwardJump) {
+        state.liveHeadSegmentIndex = Math.max(state.liveHeadSegmentIndex, segmentIndex);
+      }
       log('info', 'Segment generated', { segmentIndex, segmentFile });
       resolve(segmentFile);
       return;
     }
 
     if (primarySpawnError) {
-      log('error', 'FFmpeg spawn failed', { segmentIndex, error: primarySpawnError });
-      reject(new Error(`FFmpeg spawn failed: ${primarySpawnError}`));
+      log('error', 'ffp spawn failed', { segmentIndex, error: primarySpawnError });
+      reject(new Error(`ffp spawn failed: ${primarySpawnError}`));
       return;
     }
 
-    const nearEnd = target.sourceDuration - safeOffset < 0.75;
-    if (nearEnd && target.timelineIndex + 1 < timeline.length) {
-      const next = timeline[target.timelineIndex + 1];
+    const nearEnd = target.sourceDuration - safeOffset < SegmentDuration;
+    if (nearEnd && timeline.length > 1) {
+      const nextIndex = (target.timelineIndex + 1) % timeline.length;
+      const next = timeline[nextIndex];
       log('warn', 'Retrying segment from next source file after near-end failure', {
         segmentIndex,
         failedFile: target.fileName,
@@ -310,7 +356,10 @@ function generateSegment(segmentIndex) {
         if (generatedDuration > 0) {
           state.segmentDurationCache.set(segmentIndex, generatedDuration);
         }
-        state.liveHeadSegmentIndex = Math.max(state.liveHeadSegmentIndex, segmentIndex);
+        const maxForwardJump = PlaylistSegments + 8;
+        if (state.liveHeadSegmentIndex < 0 || segmentIndex <= state.liveHeadSegmentIndex + maxForwardJump) {
+          state.liveHeadSegmentIndex = Math.max(state.liveHeadSegmentIndex, segmentIndex);
+        }
         log('info', 'Segment generated from fallback source file', { segmentIndex, segmentFile });
         resolve(segmentFile);
         return;
@@ -331,7 +380,11 @@ async function getSegmentQueue() {
     return state.pQueueInstancePromise;
   }
 
-  state.pQueueInstancePromise = import('p-queue')
+  state.pQueueInstancePromise = Promise.resolve()
+    .then(() => {
+      const dynamicImport = (specifier) => eval('import(specifier)');
+      return dynamicImport('p-queue');
+    })
     .then((mod) => {
       const PQueue = mod.default;
       return new PQueue({ concurrency: SegmentQueueConcurrency });

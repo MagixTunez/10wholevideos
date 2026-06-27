@@ -1,4 +1,6 @@
 // @ts-nocheck
+// This wouldn't have been done without the help of globcom at https://github.com/globocom/m3u8/blob/master/tests/playlists/simple-playlist.m3u8
+// and liek some other people who have written m3u8 parsers. Love, the Rec Room Archive! [(=|]
 const fs = require('node:fs');
 const path = require('node:path');
 const { VidsDir, OutputDir, PlaylistSegments, SegmentDuration, MinSegmentBytes } = require('./config.ts');
@@ -91,21 +93,17 @@ function writeConcatFile() {
   fs.writeFileSync(concatPath, lines, 'utf8');
   return concatPath;
 }
-
 function segmentFilePath(segmentIndex, playlistName = state.activePlaylistName) {
   return path.join(liveDirForPlaylist(playlistName), `segment-${segmentIndex}.ts`);
 }
-
 function isSegmentReady(segmentIndex, playlistName = state.activePlaylistName) {
   const file = segmentFilePath(segmentIndex, playlistName);
   return fs.existsSync(file) && fs.statSync(file).size > 0;
 }
-
 function isSegmentHealthy(segmentIndex, playlistName = state.activePlaylistName) {
   const file = segmentFilePath(segmentIndex, playlistName);
   return fs.existsSync(file) && fs.statSync(file).size >= MinSegmentBytes;
 }
-
 function clearLiveSegments(playlistName = state.activePlaylistName) {
   const liveDir = liveDirForPlaylist(playlistName);
   if (!fs.existsSync(liveDir)) {
@@ -224,19 +222,17 @@ function m3u8(baseUrl, segmentIndex) {
   });
   const maxDuration = durations.reduce((max, value) => Math.max(max, value), SegmentDuration);
   const targetDuration = Math.max(1, Math.ceil(maxDuration));
-  let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-ALLOW-CACHE:NO\n#EXT-X-TARGETDURATION:${targetDuration}\n#EXT-X-MEDIA-SEQUENCE:${segmentIndex}\n`;
+  const startOffset = Math.max(1, SegmentDuration * 1.25).toFixed(3);
+  let playlist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-ALLOW-CACHE:NO\n#EXT-X-TARGETDURATION:${targetDuration}\n#EXT-X-MEDIA-SEQUENCE:${segmentIndex}\n#EXT-X-START:TIME-OFFSET=-${startOffset},PRECISE=YES\n`;
 
   for (let i = 0; i < contiguousCount; i++) {
     const idx = segmentIndex + i;
-    if (i > 0) {
-      playlist += '#EXT-X-DISCONTINUITY\n';
-    }
 
     const segmentPath = state.activePlaylistName
       ? `/live/${state.activePlaylistName}/segment-${idx}.ts`
       : `/live/segment-${idx}.ts`;
     const extinf = durations[i];
-    playlist += `#EXTINF:${extinf.toFixed(3)},\n${baseUrl}${segmentPath}\n`;
+    playlist += `#EXTINF:${extinf.toFixed(3)},\n${segmentPath}\n`;
   }
 
   return playlist;
