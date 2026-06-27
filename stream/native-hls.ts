@@ -94,7 +94,6 @@ function startNativeHlsPipeline() {
   state.nativeHlsProcess = proc;
 
   proc.stderr.on('data', () => {
-    // Keep ffmpeg stderr drained to avoid blocking.
   });
 
   proc.on('close', (code) => {
