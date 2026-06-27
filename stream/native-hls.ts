@@ -19,6 +19,7 @@ const { log } = require('./logger.ts');
 const { listVideoFiles, mediaDirForPlaylist } = require('./media.ts');
 
 let nativeHlsNextSegmentNumber = 0;
+let nativeHlsFailStreak = 0;
 
 function updateNextSegmentNumber(playlistPath) {
   try {
@@ -56,9 +57,15 @@ function startNativeHlsPipeline() {
     ? 'independent_segments+program_date_time+omit_endlist'
     : 'independent_segments+omit_endlist';
 
+  // Ensure the output directory exists — it can be absent after git clean or
+  // manual deletion since live/ is in .gitignore.
+  fs.mkdirSync(path.dirname(playlistPath), { recursive: true });
+
   // Each file is passed as a direct -i input (not through the concat demuxer) so
   // that each gets its own MP4 demuxer which correctly handles AVCC h264 and
   // non-standard AAC. We repeat the playlist repeatCount times then auto-restart.
+  // -re on each input throttles reading to real-time so the live edge doesn't
+  // race ahead of the player and cause huge MEDIA-SEQUENCE jumps / freezes.
   const repeatCount = 20;
   const nFiles = videoFilePaths.length;
   const totalSegments = nFiles * repeatCount;
@@ -66,7 +73,7 @@ function startNativeHlsPipeline() {
   const inputArgs = [];
   for (let r = 0; r < repeatCount; r++) {
     for (const fp of videoFilePaths) {
-      inputArgs.push('-i', fp);
+      inputArgs.push('-re', '-i', fp);
     }
   }
 
@@ -140,7 +147,15 @@ function startNativeHlsPipeline() {
     log('info', 'Native HLS pipeline exited, restarting', { code });
     updateNextSegmentNumber(playlistPath);
     state.nativeHlsProcess = null;
-    setTimeout(() => startNativeHlsPipeline(), 500);
+    if (code !== 0) {
+      nativeHlsFailStreak += 1;
+    } else {
+      nativeHlsFailStreak = 0;
+    }
+    const delay = nativeHlsFailStreak > 0
+      ? Math.min(500 * Math.pow(2, nativeHlsFailStreak - 1), 15000)
+      : 500;
+    setTimeout(() => startNativeHlsPipeline(), delay);
   });
 
   proc.on('error', (err) => {
